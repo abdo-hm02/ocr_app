@@ -5,83 +5,111 @@ const Tesseract = require('tesseract.js');
 const router = express.Router();
 
 const storage = multer.memoryStorage();
-const upload = multer({
- storage,
- limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
-});
+const upload = multer({ storage });
 
-// Helper function to clean text
-const cleanText = (text) => {
- return text
-   .replace(/\s+/g, '') // Remove all spaces
-   .replace(/[^A-Z0-9\u0600-\u06FF]/g, '') // Keep only uppercase letters, numbers, and Arabic characters
-   .trim();
-};
+const extractFields = (frontText, backText) => {
+  // Clean the texts
+  const cleanText = (text) => text.replace(/\s+/g, ' ').trim();
 
-// Helper function to extract specific data
-const extractData = (text) => {
- // Convert text to uppercase and clean it
- const cleanedText = text.toUpperCase();
- 
- // Create an object to store extracted data
- const data = {
-   rawText: cleanedText, // Keep raw text for reference/debugging
-   extractedData: {
-     // You can add specific extraction logic here based on your ID card format
-     // For example:
-     // idNumber: cleanedText.match(/your-pattern-here/)?.[0],
-     // name: cleanedText.match(/your-pattern-here/)?.[0],
-     // etc.
-   }
- };
+  const extractNamesAndBirthplace = (text) => {
+    // Remove header text
+    const cleanedText = text.replace(/ROYAUME DU MAROC/i, '')
+                           .replace(/ARTE NATIONALE D'IDENTITE/i, '');
+    
+    // Get all capital words (excluding common words)
+    const capitalWords = cleanedText.match(/[A-Z]{2,}/g) || [];
+    
+    return {
+      firstName: capitalWords[0] || null,
+      lastName: capitalWords[1] || null,
+      birthPlace: capitalWords[2] || null
+    };
+  };
 
- return data;
+  const extractIdNumber = (text) => {
+    const match = text.match(/N°\s*([A-Z]{1,2}\d+)/i);
+    return match ? match[1] : null;
+  };
+
+  const extractDates = (text) => {
+    const datePattern = /\d{2}[\.\/]\d{2}[\.\/]\d{4}/g;
+    const dates = text.match(datePattern) || [];
+    return {
+      birthDate: dates[0] || null,
+      expiryDate: dates[1] || null
+    };
+  };
+
+  const extractAddress = (text) => {
+    const match = text.match(/Adresse\s+(.*?)(?=\s*Sexe|$)/i);
+    return match ? match[1].trim() : null;
+  };
+
+  const extractSex = (text) => {
+    const match = text.match(/Sexe\s+([MF])/i);
+    return match ? match[1] : null;
+  };
+
+  const frontClean = cleanText(frontText);
+  const backClean = cleanText(backText);
+
+  const { firstName, lastName, birthPlace } = extractNamesAndBirthplace(frontClean);
+
+  return {
+    idNumber: extractIdNumber(backClean),
+    firstName,
+    lastName,
+    birthDate: extractDates(frontClean).birthDate,
+    expiryDate: extractDates(frontClean).expiryDate,
+    birthPlace,
+    address: extractAddress(backClean),
+    sex: extractSex(backClean),
+    civilStatus: backClean.match(/\d+\/\d{4}/)?.[0] || null
+  };
 };
 
 router.post('/scan-id', 
- upload.fields([
-   { name: 'frontImage', maxCount: 1 },
-   { name: 'backImage', maxCount: 1 }
- ]), 
- async (req, res) => {
-   try {
-     const frontImage = req.files['frontImage'][0];
-     const backImage = req.files['backImage'][0];
+  upload.fields([
+    { name: 'frontImage', maxCount: 1 },
+    { name: 'backImage', maxCount: 1 }
+  ]), 
+  async (req, res) => {
+    try {
+      const frontImage = req.files['frontImage'][0];
+      const backImage = req.files['backImage'][0];
 
-     const frontResult = await Tesseract.recognize(
-       frontImage.buffer,
-       'ara+eng',
-       {
-         logger: m => console.log(m),
-         tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-       }
-     );
+      const [frontResult, backResult] = await Promise.all([
+        Tesseract.recognize(
+          frontImage.buffer,
+          'ara+eng',
+          {
+            logger: m => console.log(m)
+          }
+        ),
+        Tesseract.recognize(
+          backImage.buffer,
+          'ara+eng',
+          {
+            logger: m => console.log(m)
+          }
+        )
+      ]);
 
-     const backResult = await Tesseract.recognize(
-       backImage.buffer,
-       'ara+eng',
-       {
-         logger: m => console.log(m),
-         tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-       }
-     );
+      const extractedData = extractFields(frontResult.data.text, backResult.data.text);
 
-     // Clean and extract data
-     const frontData = extractData(cleanText(frontResult.data.text));
-     const backData = extractData(cleanText(backResult.data.text));
+      res.json({ 
+        success: true,
+        data: extractedData,
+        rawText: {
+          front: frontResult.data.text,
+          back: backResult.data.text
+        }
+      });
 
-     res.json({
-       success: true,
-       frontSide: frontData,
-       backSide: backData
-     });
-
-   } catch (error) {
-     console.error('OCR Error:', error);
-     res.status(500).json({ 
-       error: 'Failed to process ID card'
-     });
-   }
+    } catch (error) {
+      console.error('OCR Error:', error);
+      res.status(500).json({ error: 'Failed to process ID card' });
+    }
 });
 
 module.exports = router;
